@@ -214,7 +214,7 @@ void ELM327BLEHub::run_init_sequence() {
     {"ATH0\r",   500, "Headers aus"},
     {"ATAL\r",   500, "Allow Long Messages (>7 Bytes)"},
     {"ATSTFF\r",  500, "Timeout max (1020ms pro Frame)"},
-    {"ATSP0\r", 1000, "Auto-Protokoll"},
+    {"ATSP7\r", 1000, "Auto-Protokoll"},
     {"0100\r",  5000, "Protokoll-Erkennung"},
   };
 
