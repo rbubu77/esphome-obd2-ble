@@ -9,6 +9,62 @@ namespace elm327_ble {
 static const char *TAG = "elm327_ble";
 
 // ============================================================
+// PATCH VW MEB (ID.3) - resume des modifications
+// ============================================================
+// 1. STATE_SWITCHING_HEADER passe de 2 a 4 etapes :
+//        ATCRA<filtre>   filtre de reception (absent du composant d'origine)
+//        ATSH<header>    header d'emission (deja present)
+//        1003            session diagnostic etendue      <-- LA CLE
+//        -> envoi de la requete
+//    Sans le 1003, tous les DID mode 22 renvoient NODATA sur MEB.
+//    Valide sur ID.3 : 22028C -> 62028CEF, 22295A -> 62295A0086FB.
+//
+// 2. La sequence est rejouee AVANT CHAQUE requete a header, pas seulement
+//    au changement de header : la session expire en ~5 s cote vehicule.
+//
+// 3. Le filtre de reception est derive du header (convention VW : l'octet
+//    FC de la requete devient FE dans la reponse). Aucun changement du
+//    schema YAML n'est donc necessaire.
+//
+// 4. CORRECTION DE BUG dans dispatch_raw_pid_response() : le seuil
+//    anti-troncature exigeait 8 caracteres de donnees, ce qui rejetait
+//    silencieusement toute reponse courte. 62028CEF (1 octet utile) et
+//    62295A0086FB (3 octets) etaient jetes. Seuil ramene a 1 octet.
+//
+// 5. .h : ajouter  bool header_ready_{false};  aux membres prives.
+// ============================================================
+
+// Derive l'adresse de reponse a partir de l'adresse de requete.
+//   29 bits VW : 17FC007B -> 17FE007B  (FC devient FE)
+//   11 bits    : 7E5      -> 7ED       (+8 sur le dernier nibble)
+// Chaine vide = pas de filtre applicable.
+static std::string derive_rx_filter(const std::string &header) {
+  if (header.length() == 8) {
+    if ((header[2] == 'F' || header[2] == 'f') &&
+        (header[3] == 'C' || header[3] == 'c')) {
+      std::string f = header;
+      f[3] = 'E';
+      return f;
+    }
+    return "";
+  }
+  if (header.length() == 3 && (header[0] == '7') &&
+      (header[1] == 'E' || header[1] == 'e')) {
+    char c = header[2];
+    int n = -1;
+    if (c >= '0' && c <= '9') n = c - '0';
+    else if (c >= 'A' && c <= 'F') n = c - 'A' + 10;
+    else if (c >= 'a' && c <= 'f') n = c - 'a' + 10;
+    if (n >= 0 && n < 8) {
+      std::string f = "7E";
+      f += "0123456789ABCDEF"[n + 8];
+      return f;
+    }
+  }
+  return "";
+}
+
+// ============================================================
 // BLE Connection Switch
 // ============================================================
 void ELM327BLESwitch::write_state(bool state) {
@@ -34,8 +90,10 @@ void ELM327BLEHub::dump_config() {
   if (this->dtc_text_sensor_ != nullptr)
     ESP_LOGCONFIG(TAG, "  DTC Text Sensor: ja");
   for (auto &entry : this->raw_pid_text_sensors_) {
-    ESP_LOGCONFIG(TAG, "  Raw-PID: cmd=%s header=%s prefix=%s",
-                  entry.command.c_str(), entry.header.c_str(), entry.expected_prefix.c_str());
+    ESP_LOGCONFIG(TAG, "  Raw-PID: cmd=%s header=%s rx=%s prefix=%s",
+                  entry.command.c_str(), entry.header.c_str(),
+                  derive_rx_filter(entry.header).c_str(),
+                  entry.expected_prefix.c_str());
   }
 }
 
@@ -63,6 +121,7 @@ void ELM327BLEHub::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->waiting_for_response_ = false;
       this->response_buffer_.clear();
       this->current_header_.clear();
+      this->header_ready_ = false;
       if (this->connected_binary_sensor_ != nullptr)
         this->connected_binary_sensor_->publish_state(false);
       // Switch-State synchronisieren (zeigt den enabled-Status des ble_client)
@@ -144,33 +203,68 @@ void ELM327BLEHub::loop() {
       break;
 
     case STATE_SWITCHING_HEADER: {
-      // Header-Wechsel mit festem Delay (500ms pro Schritt)
-      if (now - this->header_switch_time_ >= 500) {
-        if (this->header_switch_step_ == 0) {
-          // ATSH senden
-          std::string atsh_cmd = "ATSH" + this->pending_header_ + "\r";
-          ESP_LOGD(TAG, "Header-Wechsel: %s", atsh_cmd.c_str());
-          this->send_command(atsh_cmd);
+      // Sequence UDS en 4 etapes. Le 1003 met ~1,1 s a repondre sur MEB,
+      // d'ou le delai plus long avant l'etape finale.
+      static const uint32_t step_delay[4] = {500, 500, 500, 1500};
+      if (now - this->header_switch_time_ < step_delay[this->header_switch_step_])
+        break;
+
+      bool is_broadcast = (this->pending_header_ == "7DF");
+
+      switch (this->header_switch_step_) {
+        case 0: {
+          // Filtre de reception. Sans lui, l'ELM327 n'ecoute pas l'adresse
+          // de reponse du calculateur -> NODATA malgre un ATSH accepte.
+          std::string f = is_broadcast ? "" : derive_rx_filter(this->pending_header_);
+          std::string cmd = f.empty() ? "ATCRA\r" : ("ATCRA" + f + "\r");
+          ESP_LOGD(TAG, "Filtre reception: %s", cmd.c_str());
+          this->send_command(cmd);
           this->header_switch_step_ = 1;
           this->header_switch_time_ = now;
-        } else {
-          // Fertig: Header gesetzt
-          if (this->pending_header_ == "7DF") {
-            // Broadcast-Reset: Header intern leeren (= kein spezieller Header)
+          break;
+        }
+
+        case 1: {
+          std::string cmd = "ATSH" + this->pending_header_ + "\r";
+          ESP_LOGD(TAG, "Header-Wechsel: %s", cmd.c_str());
+          this->send_command(cmd);
+          this->header_switch_step_ = 2;
+          this->header_switch_time_ = now;
+          break;
+        }
+
+        case 2: {
+          if (is_broadcast) {
+            // Pas de session diagnostic en broadcast : on saute l'etape.
+            this->header_switch_step_ = 3;
+            this->header_switch_time_ = now - step_delay[3];
+          } else {
+            // Session diagnostic etendue. Attendue : 5003...
+            ESP_LOGD(TAG, "Session diagnostic: 1003");
+            this->send_command("1003\r");
+            this->header_switch_step_ = 3;
+            this->header_switch_time_ = now;
+          }
+          break;
+        }
+
+        default: {
+          if (is_broadcast) {
             this->current_header_.clear();
             ESP_LOGD(TAG, "Header zurueckgesetzt auf Broadcast (7DF)");
           } else {
             this->current_header_ = this->pending_header_;
-            ESP_LOGD(TAG, "Header gesetzt auf: %s", this->current_header_.c_str());
+            ESP_LOGD(TAG, "Header pret: %s", this->current_header_.c_str());
           }
           this->pending_header_.clear();
           this->header_switch_step_ = 0;
           this->state_ = STATE_READY;
-          // Response-Buffer leeren (ATSH-OK-Antwort verwerfen)
           this->response_buffer_.clear();
           this->waiting_for_response_ = false;
-          // Sofort die PID senden
+          // La session expire vite : on enchaine immediatement.
+          this->header_ready_ = true;
           this->request_next_pid();
+          break;
         }
       }
       break;
@@ -214,7 +308,7 @@ void ELM327BLEHub::run_init_sequence() {
     {"ATH0\r",   500, "Headers aus"},
     {"ATAL\r",   500, "Allow Long Messages (>7 Bytes)"},
     {"ATSTFF\r",  500, "Timeout max (1020ms pro Frame)"},
-    {"ATSP7\r", 1000, "Auto-Protokoll"},
+    {"ATSP7\r", 1000, "Protokoll 7 forciert (CAN 29 bit, 500k)"},
     {"0100\r",  5000, "Protokoll-Erkennung"},
   };
 
@@ -225,6 +319,7 @@ void ELM327BLEHub::run_init_sequence() {
     this->current_poll_index_ = 0;
     this->waiting_for_response_ = false;
     this->current_header_.clear();
+    this->header_ready_ = false;
     this->update_total_poll_count();
     if (this->connected_binary_sensor_ != nullptr)
       this->connected_binary_sensor_->publish_state(true);
@@ -332,19 +427,22 @@ void ELM327BLEHub::request_next_pid() {
 
   int idx = this->current_poll_index_ % this->total_poll_count_;
 
-  // Pruefen ob Header-Wechsel noetig
   std::string needed_header = this->get_header_for_poll_index(idx);
-  if (!needed_header.empty() && needed_header != this->current_header_) {
-    // Header-Wechsel einleiten
-    ESP_LOGD(TAG, "Header-Wechsel noetig: %s -> %s", this->current_header_.c_str(), needed_header.c_str());
+
+  // La sequence complete (ATCRA + ATSH + 1003) est rejouee AVANT CHAQUE
+  // requete a header, meme si le header n'a pas change : la session
+  // diagnostic expire en ~5 s cote vehicule.
+  if (!needed_header.empty() && !this->header_ready_) {
+    ESP_LOGD(TAG, "Sequence UDS pour %s", needed_header.c_str());
     this->pending_header_ = needed_header;
     this->header_switch_step_ = 0;
     this->header_switch_time_ = millis();
     this->state_ = STATE_SWITCHING_HEADER;
-    // Index NICHT weiterschalten — nach dem Header-Wechsel wird request_next_pid
-    // erneut aufgerufen und dann die PID gesendet
+    // Index NICHT weiterschalten
     return;
   }
+  // Jeton consomme : la prochaine requete a header rejouera la sequence.
+  this->header_ready_ = false;
 
   // Wenn wir von einem Header-Sensor zurueck zu einem ohne Header wechseln,
   // muessen wir den Header auf CAN-Broadcast (7DF) zuruecksetzen
@@ -424,7 +522,7 @@ void ELM327BLEHub::process_response(const std::string &response) {
     this->raw_text_sensor_->publish_state(clean);
   }
 
-  // Header-Wechsel Antwort (OK/ERROR) ignorieren
+  // Antworten der UDS-Sequenz (OK / 5003...) ignorieren
   if (this->state_ == STATE_SWITCHING_HEADER) {
     return;
   }
@@ -447,6 +545,8 @@ void ELM327BLEHub::process_response(const std::string &response) {
   // Damit werden alle Responses, die zu einem raw_pid Sensor passen,
   // als Hex-String weitergegeben
   bool raw_matched = this->dispatch_raw_pid_response(clean);
+  if (raw_matched)
+    return;
 
   // DTC-Antwort (Mode 03, beginnt mit "43")
   if (clean.find("43") != std::string::npos) {
@@ -466,8 +566,8 @@ void ELM327BLEHub::process_response(const std::string &response) {
     return;
   }
 
-  // Mode 22 Antwort — nur loggen wenn kein raw_pid Sensor gematcht hat
-  if (!raw_matched && clean.find("62") != std::string::npos) {
+  // Mode 22 Antwort ohne Sensor
+  if (clean.find("62") != std::string::npos) {
     ESP_LOGW(TAG, "Mode 22 Response ohne passenden Sensor: %s", clean.c_str());
     return;
   }
@@ -486,18 +586,18 @@ bool ELM327BLEHub::dispatch_raw_pid_response(const std::string &clean) {
     size_t pos = clean.find(entry.expected_prefix);
     if (pos != std::string::npos) {
       std::string data = clean.substr(pos);
-      // Schutz gegen abgeschnittene Multi-Frame Responses:
-      // Prefix (z.B. "620101") + mindestens 8 Hex-Zeichen Nutzdaten = 4 Bytes
-      // Wenn weniger, ist die Response wahrscheinlich unvollstaendig
-      size_t min_len = entry.expected_prefix.length() + 8;
+      // Schutz gegen abgeschnittene Responses : au moins 1 octet utile.
+      // ATTENTION : le seuil d'origine (prefix + 8 caracteres) rejetait
+      // silencieusement 62028CEF et 62295A0086FB. Ne pas le remonter.
+      size_t min_len = entry.expected_prefix.length() + 2;
       if (data.length() < min_len) {
-        ESP_LOGW(TAG, "Response zu kurz (%d Zeichen, erwartet >%d): %s",
+        ESP_LOGW(TAG, "Response zu kurz (%d Zeichen, erwartet >=%d): %s",
                  (int) data.length(), (int) min_len, data.c_str());
-        matched = true;  // trotzdem als matched zaehlen, damit kein "kein Sensor" Log kommt
+        matched = true;  // trotzdem als matched zaehlen
         continue;        // aber NICHT publizieren
       }
       entry.sensor->publish_state(data);
-      ESP_LOGV(TAG, "Raw-PID Match [%s]", entry.expected_prefix.c_str());
+      ESP_LOGD(TAG, "Raw-PID Match [%s] -> %s", entry.expected_prefix.c_str(), data.c_str());
       matched = true;
     }
   }
@@ -764,8 +864,9 @@ void ELM327BLEHub::register_raw_pid_text_sensor(text_sensor::TextSensor *sensor,
   }
 
   this->raw_pid_text_sensors_.push_back(entry);
-  ESP_LOGD(TAG, "Raw-PID Text-Sensor registriert: cmd=%s header=%s prefix=%s",
-           entry.command.c_str(), entry.header.c_str(), entry.expected_prefix.c_str());
+  ESP_LOGD(TAG, "Raw-PID Text-Sensor registriert: cmd=%s header=%s rx=%s prefix=%s",
+           entry.command.c_str(), entry.header.c_str(),
+           derive_rx_filter(entry.header).c_str(), entry.expected_prefix.c_str());
 }
 
 void ELM327BLEHub::register_connected_binary_sensor(binary_sensor::BinarySensor *sensor) {
@@ -797,6 +898,7 @@ void ELM327BLEHub::set_ble_enabled(bool enabled) {
     this->waiting_for_response_ = false;
     this->response_buffer_.clear();
     this->current_header_.clear();
+    this->header_ready_ = false;
     if (this->connected_binary_sensor_ != nullptr)
       this->connected_binary_sensor_->publish_state(false);
   }
