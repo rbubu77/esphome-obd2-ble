@@ -131,11 +131,14 @@ class ELM327BLEHub : public Component, public ble_client::BLEClientNode {
   uint32_t last_request_time_{0};
   bool waiting_for_response_{false};
 
-  // ATSH Header-Tracking
+  // Sequence UDS : ATCRA -> ATSH -> 1003 -> requete
   std::string current_header_;         // Aktuell gesetzter ECU-Header
   std::string pending_header_;         // Header der noch gesetzt werden muss
-  int header_switch_step_{0};          // 0=ATSH senden, 1=warten, 2=fertig
+  int header_switch_step_{0};          // 0=ATCRA, 1=ATSH, 2=1003, 3=fertig
   uint32_t header_switch_time_{0};
+  // Jeton : la sequence vient d'etre jouee, la requete peut partir.
+  // Consomme dans request_next_pid() pour eviter une boucle infinie.
+  bool header_ready_{false};
 
   // Antwort-Puffer
   std::string response_buffer_;
